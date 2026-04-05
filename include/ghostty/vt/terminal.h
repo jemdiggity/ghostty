@@ -945,6 +945,35 @@ GHOSTTY_API GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
                                     void *out);
 
 /**
+ * Get data from a specific terminal screen.
+ *
+ * Extracts typed data from the requested screen buffer rather than the
+ * currently active screen. The output pointer must be of the appropriate
+ * type for the requested data kind. Valid data kinds match the
+ * `GhosttyTerminalData` enum, but only screen-local values are meaningful.
+ * For example, cursor position, scrollback counts, and cursor style are
+ * resolved against the chosen screen, while terminal-global values such as
+ * dimensions are identical across screens.
+ *
+ * If the requested screen does not exist (for example the alternate screen
+ * has never been entered), this returns GHOSTTY_NO_VALUE.
+ *
+ * @param terminal The terminal handle (may be NULL)
+ * @param screen The screen buffer to query
+ * @param data The type of data to extract
+ * @param out Pointer to store the extracted data (type depends on data parameter)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if the requested
+ *         screen does not exist, or GHOSTTY_INVALID_VALUE if the terminal
+ *         is NULL or the data type is invalid
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_screen_get(GhosttyTerminal terminal,
+                                           GhosttyTerminalScreen screen,
+                                           GhosttyTerminalData data,
+                                           void *out);
+
+/**
  * Resolve a point in the terminal grid to a grid reference.
  *
  * Resolves the given point (which can be in active, viewport, screen,
@@ -973,6 +1002,32 @@ GHOSTTY_API GhosttyResult ghostty_terminal_get(GhosttyTerminal terminal,
 GHOSTTY_API GhosttyResult ghostty_terminal_grid_ref(GhosttyTerminal terminal,
                                         GhosttyPoint point,
                                         GhosttyGridRef *out_ref);
+
+/**
+ * Resolve a point in a specific terminal screen to a grid reference.
+ *
+ * Resolves the given point against the requested screen buffer rather than
+ * the currently active screen. The same coordinate tags as
+ * ghostty_terminal_grid_ref() are accepted, but they are interpreted against
+ * the chosen screen's page list.
+ *
+ * If the requested screen does not exist (for example the alternate screen
+ * has never been entered), this returns GHOSTTY_NO_VALUE.
+ *
+ * @param terminal The terminal handle (NULL returns GHOSTTY_INVALID_VALUE)
+ * @param screen The screen buffer to query
+ * @param point The point specifying which cell to look up
+ * @param[out] out_ref On success, set to the grid reference at the given point (may be NULL)
+ * @return GHOSTTY_SUCCESS on success, GHOSTTY_NO_VALUE if the requested
+ *         screen does not exist, or GHOSTTY_INVALID_VALUE if the terminal
+ *         is NULL or the point is out of bounds
+ *
+ * @ingroup terminal
+ */
+GHOSTTY_API GhosttyResult ghostty_terminal_screen_grid_ref(GhosttyTerminal terminal,
+                                                GhosttyTerminalScreen screen,
+                                                GhosttyPoint point,
+                                                GhosttyGridRef *out_ref);
 
 /** @} */
 

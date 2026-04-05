@@ -5,6 +5,7 @@ const CAllocator = lib.alloc.Allocator;
 const ZigTerminal = @import("../Terminal.zig");
 const Stream = @import("../stream_terminal.zig").Stream;
 const ScreenSet = @import("../ScreenSet.zig");
+const Screen = @import("../Screen.zig");
 const PageList = @import("../PageList.zig");
 const kitty = @import("../kitty/key.zig");
 const modes = @import("../modes.zig");
@@ -567,18 +568,28 @@ fn getTyped(
     out: *data.OutType(),
 ) Result {
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const screen = t.screens.active;
+    return getTypedForScreen(t, screen, data, out);
+}
+
+fn getTypedForScreen(
+    t: *ZigTerminal,
+    screen: anytype,
+    comptime data: TerminalData,
+    out: *data.OutType(),
+) Result {
     switch (data) {
         .invalid => return .invalid_value,
         .cols => out.* = t.cols,
         .rows => out.* = t.rows,
-        .cursor_x => out.* = t.screens.active.cursor.x,
-        .cursor_y => out.* = t.screens.active.cursor.y,
-        .cursor_pending_wrap => out.* = t.screens.active.cursor.pending_wrap,
+        .cursor_x => out.* = screen.cursor.x,
+        .cursor_y => out.* = screen.cursor.y,
+        .cursor_pending_wrap => out.* = screen.cursor.pending_wrap,
         .active_screen => out.* = t.screens.active_key,
         .cursor_visible => out.* = t.modes.get(.cursor_visible),
-        .kitty_keyboard_flags => out.* = @as(u8, t.screens.active.kitty_keyboard.current().int()),
-        .scrollbar => out.* = t.screens.active.pages.scrollbar().cval(),
-        .cursor_style => out.* = .fromStyle(t.screens.active.cursor.style),
+        .kitty_keyboard_flags => out.* = @as(u8, screen.kitty_keyboard.current().int()),
+        .scrollbar => out.* = screen.pages.scrollbar().cval(),
+        .cursor_style => out.* = .fromStyle(screen.cursor.style),
         .mouse_tracking => out.* = t.modes.get(.mouse_event_x10) or
             t.modes.get(.mouse_event_normal) or
             t.modes.get(.mouse_event_button) or
@@ -591,8 +602,8 @@ fn getTyped(
             const pwd = t.getPwd() orelse "";
             out.* = .{ .ptr = pwd.ptr, .len = pwd.len };
         },
-        .total_rows => out.* = t.screens.active.pages.total_rows,
-        .scrollback_rows => out.* = t.screens.active.pages.total_rows - t.rows,
+        .total_rows => out.* = screen.pages.total_rows,
+        .scrollback_rows => out.* = screen.pages.total_rows - t.rows,
         .width_px => out.* = t.width_px,
         .height_px => out.* = t.height_px,
         .color_foreground => out.* = (t.colors.foreground.get() orelse return .no_value).cval(),
@@ -608,22 +619,75 @@ fn getTyped(
     return .success;
 }
 
+fn getScreen(
+    t: *ZigTerminal,
+    screen: TerminalScreen,
+) ?*Screen {
+    return t.screens.get(screen);
+}
+
+pub fn screen_get(
+    terminal_: Terminal,
+    screen_tag: TerminalScreen,
+    data: TerminalData,
+    out: ?*anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime std.debug.runtime_safety) {
+        _ = std.meta.intToEnum(TerminalData, @intFromEnum(data)) catch {
+            log.warn("terminal_screen_get invalid data value={d}", .{@intFromEnum(data)});
+            return .invalid_value;
+        };
+    }
+
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const screen = getScreen(t, screen_tag) orelse return .no_value;
+
+    return switch (data) {
+        .invalid => .invalid_value,
+        inline else => |comptime_data| getTypedForScreen(
+            t,
+            screen,
+            comptime_data,
+            @ptrCast(@alignCast(out)),
+        ),
+    };
+}
+
 pub fn grid_ref(
     terminal_: Terminal,
     pt: point.Point.C,
     out_ref: ?*grid_ref_c.CGridRef,
 ) callconv(lib.calling_conv) Result {
     const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    return grid_refForScreen(t.screens.active, pt, out_ref);
+}
+
+fn grid_refForScreen(
+    screen: anytype,
+    pt: point.Point.C,
+    out_ref: ?*grid_ref_c.CGridRef,
+) Result {
     const zig_pt: point.Point = switch (pt.tag) {
         .active => .{ .active = pt.value.active },
         .viewport => .{ .viewport = pt.value.viewport },
         .screen => .{ .screen = pt.value.screen },
         .history => .{ .history = pt.value.history },
     };
-    const p = t.screens.active.pages.pin(zig_pt) orelse
+    const p = screen.pages.pin(zig_pt) orelse
         return .invalid_value;
     if (out_ref) |out| out.* = grid_ref_c.CGridRef.fromPin(p);
     return .success;
+}
+
+pub fn screen_grid_ref(
+    terminal_: Terminal,
+    screen_tag: TerminalScreen,
+    pt: point.Point.C,
+    out_ref: ?*grid_ref_c.CGridRef,
+) callconv(lib.calling_conv) Result {
+    const t: *ZigTerminal = (terminal_ orelse return .invalid_value).terminal;
+    const screen = getScreen(t, screen_tag) orelse return .no_value;
+    return grid_refForScreen(screen, pt, out_ref);
 }
 
 pub fn free(terminal_: Terminal) callconv(lib.calling_conv) void {
@@ -1020,6 +1084,48 @@ test "get active_screen" {
     try testing.expectEqual(.primary, screen);
 }
 
+test "screen_get primary and alternate state" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 8,
+            .rows = 2,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    vt_write(t, "ab", 2);
+    vt_write(t, "\x1b[?1049h", 8);
+    vt_write(t, "\x1b[Hxy", 5);
+
+    var cursor_x: size.CellCountInt = undefined;
+    try testing.expectEqual(Result.success, screen_get(t, .primary, .cursor_x, @ptrCast(&cursor_x)));
+    try testing.expectEqual(2, cursor_x);
+
+    try testing.expectEqual(Result.success, screen_get(t, .alternate, .cursor_x, @ptrCast(&cursor_x)));
+    try testing.expectEqual(2, cursor_x);
+}
+
+test "screen_get alternate missing returns no_value" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 8,
+            .rows = 2,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    var cursor_x: size.CellCountInt = undefined;
+    try testing.expectEqual(Result.no_value, screen_get(t, .alternate, .cursor_x, @ptrCast(&cursor_x)));
+}
+
 test "get kitty_keyboard_flags" {
     var t: Terminal = null;
     try testing.expectEqual(Result.success, new(
@@ -1180,6 +1286,60 @@ test "grid_ref" {
     var cp: u32 = 0;
     try testing.expectEqual(Result.success, cell_c.get(out_cell, .codepoint, @ptrCast(&cp)));
     try testing.expectEqual(@as(u32, 'H'), cp);
+}
+
+test "screen_grid_ref reads inactive primary while alternate is active" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 8,
+            .rows = 2,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    vt_write(t, "ab", 2);
+    vt_write(t, "\x1b[?1049h", 8);
+    vt_write(t, "\x1b[Hxy", 5);
+
+    var out_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.success, screen_grid_ref(t, .primary, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 0, .y = 0 } },
+    }, &out_ref));
+    var out_cell: cell_c.Cell = undefined;
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&out_ref, &out_cell));
+    try testing.expectEqual(@as(u32, 'a'), out_cell.content.codepoint);
+
+    try testing.expectEqual(Result.success, screen_grid_ref(t, .alternate, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 0, .y = 0 } },
+    }, &out_ref));
+    try testing.expectEqual(Result.success, grid_ref_c.grid_ref_cell(&out_ref, &out_cell));
+    try testing.expectEqual(@as(u32, 'x'), out_cell.content.codepoint);
+}
+
+test "screen_grid_ref alternate missing returns no_value" {
+    var t: Terminal = null;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &t,
+        .{
+            .cols = 8,
+            .rows = 2,
+            .max_scrollback = 0,
+        },
+    ));
+    defer free(t);
+
+    var out_ref: grid_ref_c.CGridRef = .{};
+    try testing.expectEqual(Result.no_value, screen_grid_ref(t, .alternate, .{
+        .tag = .screen,
+        .value = .{ .screen = .{ .x = 0, .y = 0 } },
+    }, &out_ref));
 }
 
 test "grid_ref null terminal" {
