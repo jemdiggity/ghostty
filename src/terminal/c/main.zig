@@ -192,6 +192,7 @@ pub const terminal_compression_activity = terminal.compression_activity;
 pub const terminal_compress = terminal.compress;
 pub const terminal_get = terminal.get;
 pub const terminal_get_multi = terminal.get_multi;
+pub const terminal_screen_get = terminal.screen_get;
 pub const terminal_continuation_write = terminal.continuation_write;
 pub const terminal_continuation_buf = terminal.continuation_buf;
 pub const terminal_continuation_alloc = terminal.continuation_alloc;
@@ -225,6 +226,7 @@ pub const search_set = search.set;
 pub const search_get = search.get;
 pub const search_get_multi = search.get_multi;
 pub const terminal_grid_ref = terminal.grid_ref;
+pub const terminal_screen_grid_ref = terminal.screen_grid_ref;
 pub const terminal_grid_ref_track = terminal.grid_ref_track;
 pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 

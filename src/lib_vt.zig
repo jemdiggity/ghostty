@@ -326,6 +326,7 @@ comptime {
         @export(&c.terminal_compress, .{ .name = "ghostty_terminal_compress" });
         @export(&c.terminal_get, .{ .name = "ghostty_terminal_get" });
         @export(&c.terminal_get_multi, .{ .name = "ghostty_terminal_get_multi" });
+        @export(&c.terminal_screen_get, .{ .name = "ghostty_terminal_screen_get" });
         @export(&c.terminal_continuation_write, .{ .name = "ghostty_terminal_continuation_write" });
         @export(&c.terminal_continuation_buf, .{ .name = "ghostty_terminal_continuation_buf" });
         @export(&c.terminal_continuation_alloc, .{ .name = "ghostty_terminal_continuation_alloc" });
@@ -364,6 +365,7 @@ comptime {
         // reference constructors are required by both features.
         if (features.grid_introspection or features.selection) {
             @export(&c.terminal_grid_ref, .{ .name = "ghostty_terminal_grid_ref" });
+            @export(&c.terminal_screen_grid_ref, .{ .name = "ghostty_terminal_screen_grid_ref" });
             @export(&c.terminal_point_from_grid_ref, .{ .name = "ghostty_terminal_point_from_grid_ref" });
         }
         if (features.grid_introspection) {
