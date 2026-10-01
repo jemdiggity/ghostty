@@ -442,6 +442,17 @@ pub inline fn queueWrite(
     try self.backend.queueWrite(self.alloc, td, data, linefeed);
 }
 
+/// Queue bytes generated in response to terminal output. External backends
+/// discard these instead of answering a query already handled by the owner.
+pub inline fn queueResponse(
+    self: *Termio,
+    td: *ThreadData,
+    data: []const u8,
+    linefeed: bool,
+) !void {
+    try self.backend.queueResponse(self.alloc, td, data, linefeed);
+}
+
 /// Update the configuration.
 pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !void {
     // The remainder of this function is modifying terminal state or
@@ -533,6 +544,57 @@ pub fn resize(
     self.renderer_wakeup.notify() catch {};
 }
 
+/// Resize terminal state to a host-authoritative grid without changing the
+/// view-derived screen size or sending a resize to the backend.
+pub fn resizeGrid(self: *Termio, cols: u16, rows: u16) !void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+    try self.terminal.resize(self.alloc, .{
+        .cols = cols,
+        .rows = rows,
+        .cell_size_px = .{
+            .width = self.size.cell.width,
+            .height = self.size.cell.height,
+        },
+    });
+    _ = self.renderer_mailbox.push(global.io(), .{ .resize = self.size }, .{ .forever = {} });
+    self.renderer_wakeup.notify() catch {};
+}
+
+/// Replace terminal state with a decoded native snapshot. The caller must
+/// have ordered this operation through the termio mailbox.
+pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) void {
+    self.renderer_state.mutex.lockUncancelable(global.io());
+    defer self.renderer_state.mutex.unlock(global.io());
+
+    self.terminal_stream.deinit();
+    self.terminal.deinit(self.alloc);
+    self.terminal = decoded.toOwned();
+    self.renderer_state.terminal = &self.terminal;
+    self.terminal_stream = .init(.{
+        .allocator = self.alloc,
+        .handler = .{
+            .alloc = self.alloc,
+            .termio_mailbox = &self.mailbox,
+            .surface_mailbox = self.surface_mailbox,
+            .renderer_state = self.renderer_state,
+            .renderer_wakeup = self.renderer_wakeup,
+            .renderer_mailbox = self.renderer_mailbox,
+            .size = &self.size,
+            .terminal = &self.terminal,
+            .osc_color_report_format = self.config.osc_color_report_format,
+            .clipboard_write = self.config.clipboard_write,
+            .clipboard_write_limit = self.config.clipboard_write_limit,
+            .enquiry_response = self.config.enquiry_response,
+        },
+    });
+    switch (decoded.continuation) {
+        .ground => {},
+        .bytes => |bytes| self.terminal_stream.nextSlice(bytes),
+    }
+    self.renderer_wakeup.notify() catch {};
+}
+
 /// Make a size report.
 pub fn sizeReport(self: *Termio, td: *ThreadData, style: termio.Message.SizeReport) !void {
     self.renderer_state.mutex.lockUncancelable(global.io());
@@ -559,7 +621,7 @@ fn sizeReportLocked(self: *Termio, td: *ThreadData, style: termio.Message.SizeRe
         report_size,
     );
 
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueResponse(td, writer.buffered(), false);
 }
 
 /// Reset the synchronized output mode. This is usually called by timer
@@ -764,7 +826,7 @@ pub fn colorSchemeReportLocked(self: *Termio, td: *ThreadData, force: bool) !voi
     var buf: [terminalpkg.device_status.max_color_scheme_report_encode_size]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
     try terminalpkg.device_status.encodeColorSchemeReport(&writer, scheme);
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueResponse(td, writer.buffered(), false);
 }
 
 /// Sends a visibility report to the pty. Unforced reports are only sent while
@@ -788,7 +850,7 @@ pub fn visibilityReport(
         &writer,
         if (visible) .potentially_visible else .not_visible,
     );
-    try self.queueWrite(td, writer.buffered(), false);
+    try self.queueResponse(td, writer.buffered(), false);
 }
 
 /// ThreadData is the data created and stored in the termio thread

@@ -369,6 +369,30 @@ fn drainMailbox(
                 defer v.alloc.free(v.data);
                 io.processOutput(v.data);
             },
+            .external_grid_size => |v| try io.resizeGrid(v.cols, v.rows),
+            .external_snapshot => |v| {
+                defer {
+                    v.decoded.deinit(v.alloc);
+                    v.alloc.destroy(v.decoded);
+                }
+                io.loadSnapshot(v.decoded);
+            },
+            .response_write => |v| switch (v) {
+                .small => |write| try io.queueResponse(
+                    data,
+                    write.data[0..write.len],
+                    self.flags.linefeed_mode,
+                ),
+                .stable => |write| try io.queueResponse(
+                    data,
+                    write,
+                    self.flags.linefeed_mode,
+                ),
+                .alloc => |write| {
+                    defer write.alloc.free(write.data);
+                    try io.queueResponse(data, write.data, self.flags.linefeed_mode);
+                },
+            },
         }
     }
 

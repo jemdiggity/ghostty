@@ -454,6 +454,9 @@ pub const Surface = struct {
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
     inspector: ?*Inspector = null,
+    io_mode: c_int = 0,
+    io_write_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+    io_resize_request_cb: ?*const fn (?*anyopaque, u16, u16, u32, u32) callconv(.c) void = null,
 
     /// The current title of the surface. The embedded apprt saves this so
     /// that getTitle works without the implementer needing to save it.
@@ -468,6 +471,11 @@ pub const Surface = struct {
 
         /// Userdata passed to some of the callbacks.
         userdata: ?*anyopaque = null,
+
+        /// 0 selects the normal exec backend; 1 selects externally owned I/O.
+        io_mode: c_int = 0,
+        io_write_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+        io_resize_request_cb: ?*const fn (?*anyopaque, u16, u16, u32, u32) callconv(.c) void = null,
 
         /// The scale factor of the screen.
         scale_factor: f64 = 1,
@@ -507,6 +515,9 @@ pub const Surface = struct {
             .app = app,
             .platform = try .init(opts.platform_tag, opts.platform),
             .userdata = opts.userdata,
+            .io_mode = opts.io_mode,
+            .io_write_cb = opts.io_write_cb,
+            .io_resize_request_cb = opts.io_resize_request_cb,
             .core_surface = undefined,
             .content_scale = .{
                 .x = @floatCast(opts.scale_factor),
@@ -1966,6 +1977,7 @@ pub const CAPI = struct {
         bytes: [*]const u8,
         len: usize,
     ) bool {
+        if (surface.io_mode != 1) return false;
         const alloc = surface.app.core_app.alloc;
         const owned = alloc.dupe(u8, bytes[0..len]) catch return false;
         const msg: termio.Message = .{ .external_output = .{
@@ -1978,6 +1990,48 @@ pub const CAPI = struct {
         }
         surface.core_surface.io.mailbox.notify();
         return true;
+    }
+
+    /// Apply a terminal grid size selected by the external I/O owner. The
+    /// resize is ordered with queued output on the termio thread.
+    export fn ghostty_surface_set_grid_size(surface: *Surface, cols: u16, rows: u16) bool {
+        if (surface.io_mode != 1) return false;
+        const msg: termio.Message = .{ .external_grid_size = .{ .cols = cols, .rows = rows } };
+        if (!surface.core_surface.io.mailbox.trySend(msg)) return false;
+        surface.core_surface.io.mailbox.notify();
+        return true;
+    }
+
+    /// Decode a native GHOSTSNP snapshot and queue it in termio order. False
+    /// indicates malformed/unsupported snapshot data or a full mailbox.
+    export fn ghostty_surface_load_snapshot(surface: *Surface, bytes: [*]const u8, len: usize) bool {
+        if (surface.io_mode != 1) return false;
+        const alloc = surface.app.core_app.alloc;
+        var reader: std.Io.Reader = .fixed(bytes[0..len]);
+        var decoded = terminal.snapshot.decodeExact(alloc, global.io(), &reader, .{
+            .max_continuation_bytes = 1024 * 1024,
+        }) catch return false;
+        const decoded_ptr = alloc.create(terminal.snapshot.Decoded) catch {
+            decoded.deinit(alloc);
+            return false;
+        };
+        decoded_ptr.* = decoded;
+        const msg: termio.Message = .{ .external_snapshot = .{
+            .alloc = alloc,
+            .decoded = decoded_ptr,
+        } };
+        if (!surface.core_surface.io.mailbox.trySend(msg)) {
+            msg.deinit();
+            return false;
+        }
+        surface.core_surface.io.mailbox.notify();
+        return true;
+    }
+
+    /// Mark an externally managed process as exited without closing surface.
+    export fn ghostty_surface_set_process_exited(surface: *Surface, status: i32) void {
+        if (surface.io_mode != 1) return;
+        surface.core_surface.externalProcessExited(status);
     }
 
     /// Return the size information a surface has.

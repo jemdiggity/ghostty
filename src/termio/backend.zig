@@ -11,28 +11,57 @@ const ProcessInfo = @import("../pty.zig").ProcessInfo;
 const WRITE_REQ_PREALLOC = std.math.pow(usize, 2, 5);
 
 /// The kinds of backends.
-pub const Kind = enum { exec };
+pub const Kind = enum { exec, external };
+
+pub const External = struct {
+    userdata: ?*anyopaque,
+    write_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+
+    pub fn initTerminal(self: *External, t: *terminal.Terminal) void {
+        _ = self;
+        _ = t;
+    }
+
+    pub fn threadEnter(self: *External, _: Allocator, _: *termio.Termio, td: *termio.Termio.ThreadData) !void {
+        td.backend = .{ .external = {} };
+        _ = self;
+    }
+
+    pub fn threadExit(_: *External, _: *termio.Termio.ThreadData) void {}
+    pub fn focusGained(_: *External, _: *termio.Termio.ThreadData, _: bool) !void {}
+    pub fn resize(_: *External, _: renderer.GridSize, _: renderer.ScreenSize) !void {}
+
+    pub fn queueWrite(self: *External, _: Allocator, _: *termio.Termio.ThreadData, data: []const u8, _: bool) !void {
+        if (self.write_cb) |callback| callback(self.userdata, data.ptr, data.len);
+    }
+
+    pub fn deinit(_: *External) void {}
+};
 
 /// Configuration for the various backend types.
 pub const Config = union(Kind) {
     /// Exec uses posix exec to run a command with a pty.
     exec: termio.Exec.Config,
+    external: External,
 };
 
 /// Backend implementations. A backend is responsible for owning the pty
 /// behavior and providing read/write capabilities.
 pub const Backend = union(Kind) {
     exec: termio.Exec,
+    external: External,
 
     pub fn deinit(self: *Backend) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(),
+            .external => |*external| external.deinit(),
         }
     }
 
     pub fn initTerminal(self: *Backend, t: *terminal.Terminal) void {
         switch (self.*) {
             .exec => |*exec| exec.initTerminal(t),
+            .external => |*external| external.initTerminal(t),
         }
     }
 
@@ -44,12 +73,14 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.threadEnter(alloc, io, td),
+            .external => |*external| try external.threadEnter(alloc, io, td),
         }
     }
 
     pub fn threadExit(self: *Backend, td: *termio.Termio.ThreadData) void {
         switch (self.*) {
             .exec => |*exec| exec.threadExit(td),
+            .external => |*external| external.threadExit(td),
         }
     }
 
@@ -60,6 +91,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.focusGained(td, focused),
+            .external => |*external| try external.focusGained(td, focused),
         }
     }
 
@@ -70,6 +102,7 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.resize(grid_size, screen_size),
+            .external => |*external| try external.resize(grid_size, screen_size),
         }
     }
 
@@ -82,6 +115,20 @@ pub const Backend = union(Kind) {
     ) !void {
         switch (self.*) {
             .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            .external => |*external| try external.queueWrite(alloc, td, data, linefeed),
+        }
+    }
+
+    pub fn queueResponse(
+        self: *Backend,
+        alloc: Allocator,
+        td: *termio.Termio.ThreadData,
+        data: []const u8,
+        linefeed: bool,
+    ) !void {
+        switch (self.*) {
+            .exec => |*exec| try exec.queueWrite(alloc, td, data, linefeed),
+            .external => {},
         }
     }
 
@@ -99,6 +146,7 @@ pub const Backend = union(Kind) {
                 exit_code,
                 runtime_ms,
             ),
+            .external => {},
         }
     }
 
@@ -108,6 +156,7 @@ pub const Backend = union(Kind) {
     pub fn getProcessInfo(self: *Backend, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
         return switch (self.*) {
             .exec => |*exec| exec.getProcessInfo(info),
+            .external => null,
         };
     }
 };
@@ -115,10 +164,12 @@ pub const Backend = union(Kind) {
 /// Termio thread data. See termio.ThreadData for docs.
 pub const ThreadData = union(Kind) {
     exec: termio.Exec.ThreadData,
+    external: void,
 
     pub fn deinit(self: *ThreadData, alloc: Allocator) void {
         switch (self.*) {
             .exec => |*exec| exec.deinit(alloc),
+            .external => {},
         }
     }
 
@@ -127,3 +178,26 @@ pub const ThreadData = union(Kind) {
         _ = config;
     }
 };
+
+var external_test_bytes: [16]u8 = undefined;
+var external_test_len: usize = 0;
+
+fn externalTestWrite(_: ?*anyopaque, bytes: [*]const u8, len: usize) callconv(.c) void {
+    @memcpy(external_test_bytes[0..len], bytes[0..len]);
+    external_test_len = len;
+}
+
+test "external backend forwards input and discards terminal responses" {
+    const testing = std.testing;
+    external_test_len = 0;
+    var backend: Backend = .{ .external = .{
+        .userdata = null,
+        .write_cb = externalTestWrite,
+    } };
+    var td: termio.Termio.ThreadData = undefined;
+
+    try backend.queueWrite(testing.allocator, &td, "input", false);
+    try testing.expectEqualStrings("input", external_test_bytes[0..external_test_len]);
+    try backend.queueResponse(testing.allocator, &td, "reply", false);
+    try testing.expectEqual(@as(usize, 5), external_test_len);
+}

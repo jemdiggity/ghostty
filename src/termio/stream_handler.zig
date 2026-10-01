@@ -141,7 +141,13 @@ pub const StreamHandler = struct {
     }
 
     inline fn messageWriter(self: *StreamHandler, msg: termio.Message) void {
-        self.termio_mailbox.send(msg, self.renderer_state.mutex);
+        const response: termio.Message = switch (msg) {
+            .write_small => |value| .{ .response_write = .{ .small = value } },
+            .write_stable => |value| .{ .response_write = .{ .stable = value } },
+            .write_alloc => |value| .{ .response_write = .{ .alloc = value } },
+            else => msg,
+        };
+        self.termio_mailbox.send(response, self.renderer_state.mutex);
         self.termio_messaged = true;
     }
 
@@ -1959,10 +1965,13 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     const msg = response.?;
     defer msg.deinit();
     switch (msg) {
-        .write_alloc => |v| try testing.expectEqualStrings(
-            "\x1B]5522;type=write:status=EFBIG:id=macos\x1B\\",
-            v.data,
-        ),
+        .response_write => |v| switch (v) {
+            .alloc => |write| try testing.expectEqualStrings(
+                "\x1B]5522;type=write:status=EFBIG:id=macos\x1B\\",
+                write.data,
+            ),
+            else => try testing.expect(false),
+        },
         else => try testing.expect(false),
     }
 

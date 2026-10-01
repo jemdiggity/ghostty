@@ -660,8 +660,9 @@ pub fn init(
             std.fmt.bufPrint(&buf, "0x{x:0>16}", .{self.id}) catch unreachable,
         );
 
-        // Initialize our IO backend
-        var io_exec = try termio.Exec.init(alloc, .{
+        // Initialize our IO backend. The embedded API opts into external I/O;
+        // desktop app runtimes retain the exec backend.
+        const exec_config: termio.Exec.Config = .{
             .command = command,
             .env = env,
             .env_override = config.env,
@@ -673,8 +674,16 @@ pub fn init(
             .term = config.term,
             .rt_pre_exec_info = .init(config),
             .rt_post_fork_info = .init(config),
-        });
-        errdefer io_exec.deinit();
+        };
+        const io_backend: termio.Backend = if (comptime @hasField(@TypeOf(rt_surface.*), "io_mode")) backend: {
+            if (rt_surface.io_mode == 1) break :backend .{ .external = .{
+                .userdata = rt_surface.userdata,
+                .write_cb = rt_surface.io_write_cb,
+            } };
+            break :backend .{ .exec = try termio.Exec.init(alloc, exec_config) };
+        } else .{ .exec = try termio.Exec.init(alloc, exec_config) };
+        var backend_owned = io_backend;
+        errdefer backend_owned.deinit();
 
         // Initialize our IO mailbox
         var io_mailbox = try termio.Mailbox.initSPSC(alloc);
@@ -684,7 +693,7 @@ pub fn init(
             .size = size,
             .full_config = config,
             .config = try termio.Termio.DerivedConfig.init(alloc, config),
-            .backend = .{ .exec = io_exec },
+            .backend = backend_owned,
             .mailbox = io_mailbox,
             .renderer_state = &self.renderer_state,
             .renderer_wakeup = render_thread.wakeup,
@@ -1261,7 +1270,7 @@ fn selectionScrollTick(self: *Surface) !void {
     try self.queueRender();
 }
 
-fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
+pub fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     // Mark our flag that we exited immediately
     self.child_exited = true;
 
@@ -1341,6 +1350,14 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
     self.close();
 }
 
+/// Mark an externally owned process as exited without applying the exec
+/// backend's close policy.
+pub fn externalProcessExited(self: *Surface, status: i32) void {
+    _ = status;
+    self.child_exited = true;
+    self.queueRender() catch |err| log.warn("failed to render external process exit err={}", .{err});
+}
+
 /// Called when the child process exited abnormally.
 fn childExitedAbnormally(
     self: *Surface,
@@ -1353,6 +1370,7 @@ fn childExitedAbnormally(
     // Build up our command for the error message
     const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
         .exec => |*exec| exec.subprocess.args,
+        .external => &.{},
     });
     const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
 
@@ -2595,8 +2613,23 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
-    // Mail the IO thread
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    // External I/O hosts own the terminal size. Report the proposed grid
+    // without changing terminal state; the host later applies its authority.
+    if (comptime @hasField(@TypeOf(self.rt_surface.*), "io_mode")) {
+        if (self.rt_surface.io_mode == 1) {
+            if (self.rt_surface.io_resize_request_cb) |callback| callback(
+                self.rt_surface.userdata,
+                grid_size.columns,
+                grid_size.rows,
+                self.size.screen.width,
+                self.size.screen.height,
+            );
+        } else {
+            self.queueIo(.{ .resize = self.size }, .unlocked);
+        }
+    } else {
+        self.queueIo(.{ .resize = self.size }, .unlocked);
+    }
 
     // Mail the render thread so it updates its padding and screen size.
     _ = self.renderer_thread.mailbox.push(
