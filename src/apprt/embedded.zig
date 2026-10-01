@@ -472,11 +472,6 @@ pub const Surface = struct {
         /// Userdata passed to some of the callbacks.
         userdata: ?*anyopaque = null,
 
-        /// 0 selects the normal exec backend; 1 selects externally owned I/O.
-        io_mode: c_int = 0,
-        io_write_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
-        io_resize_request_cb: ?*const fn (?*anyopaque, u16, u16, u32, u32) callconv(.c) void = null,
-
         /// The scale factor of the screen.
         scale_factor: f64 = 1,
 
@@ -508,6 +503,11 @@ pub const Surface = struct {
 
         /// Context for the new surface
         context: apprt.surface.NewSurfaceContext = .window,
+
+        /// 0 selects the normal exec backend; 1 selects externally owned I/O.
+        io_mode: c_int = 0,
+        io_write_cb: ?*const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void = null,
+        io_resize_request_cb: ?*const fn (?*anyopaque, u16, u16, u32, u32) callconv(.c) void = null,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
