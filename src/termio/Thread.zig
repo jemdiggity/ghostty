@@ -365,6 +365,10 @@ fn drainMailbox(
                     self.flags.linefeed_mode,
                 );
             },
+            .external_output => |v| {
+                defer v.alloc.free(v.data);
+                io.processOutput(v.data);
+            },
         }
     }
 

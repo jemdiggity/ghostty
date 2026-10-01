@@ -97,6 +97,10 @@ pub const Message = union(enum) {
     /// Write where the data is allocated and must be freed.
     write_alloc: WriteReq.Alloc,
 
+    /// Output supplied by an embedding host. Ownership transfers to the
+    /// mailbox and the bytes are parsed on the termio thread.
+    external_output: WriteReq.Alloc,
+
     /// The payload of the kitty_clipboard_grant_* messages. The
     /// password is allocated and must be freed.
     pub const KittyClipboardGrant = struct {
@@ -123,7 +127,7 @@ pub const Message = union(enum) {
                 v.ptr.deinit();
                 v.alloc.destroy(v.ptr);
             },
-            .write_alloc => |v| v.alloc.free(v.data),
+            .write_alloc, .external_output => |v| v.alloc.free(v.data),
             .kitty_clipboard_grant_read,
             .kitty_clipboard_grant_write,
             => |v| v.alloc.free(v.pw),

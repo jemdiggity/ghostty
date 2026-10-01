@@ -16,6 +16,7 @@ const input = @import("../input.zig");
 const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
+const termio = @import("../termio.zig");
 const CoreApp = @import("../App.zig");
 const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
@@ -1955,6 +1956,28 @@ pub const CAPI = struct {
     /// to the pty and the renderer.
     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
         surface.updateSize(w, h);
+    }
+
+    /// Queue bytes supplied by an external I/O owner. The bytes are copied
+    /// before returning. False means the bounded I/O mailbox was full and
+    /// the bytes were discarded; callers may retry after draining output.
+    export fn ghostty_surface_process_output(
+        surface: *Surface,
+        bytes: [*]const u8,
+        len: usize,
+    ) bool {
+        const alloc = surface.app.core_app.alloc;
+        const owned = alloc.dupe(u8, bytes[0..len]) catch return false;
+        const msg: termio.Message = .{ .external_output = .{
+            .alloc = alloc,
+            .data = owned,
+        } };
+        if (!surface.core_surface.io.mailbox.trySend(msg)) {
+            alloc.free(owned);
+            return false;
+        }
+        surface.core_surface.io.mailbox.notify();
+        return true;
     }
 
     /// Return the size information a surface has.

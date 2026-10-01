@@ -97,6 +97,14 @@ pub const Mailbox = union(enum) {
         }
     }
 
+    /// Queue a message without waiting for space. The caller retains
+    /// ownership when this returns false.
+    pub fn trySend(self: *Mailbox, msg: termio.Message) bool {
+        return switch (self.*) {
+            .spsc => |*mb| mb.queue.push(global.io(), msg, .{ .instant = {} }) > 0,
+        };
+    }
+
     /// Notify that there are new messages. This may be a noop depending
     /// on the writer type.
     pub fn notify(self: *Mailbox) void {
@@ -107,3 +115,14 @@ pub const Mailbox = union(enum) {
         }
     }
 };
+
+test "trySend drops work instead of waiting for a full mailbox" {
+    const testing = std.testing;
+    var mailbox = try Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+
+    for (0..64) |_| {
+        try testing.expect(mailbox.trySend(.{ .crash = {} }));
+    }
+    try testing.expect(!mailbox.trySend(.{ .crash = {} }));
+}
