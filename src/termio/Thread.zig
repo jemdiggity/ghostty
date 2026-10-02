@@ -256,6 +256,7 @@ fn threadMain_(self: *Thread, io: *termio.Termio) !void {
         .spsc => |*v| v,
         // else => return error.TermioUnsupportedMailbox,
     };
+    io.mailbox.setOwner();
 
     // This is the data sent to xev callbacks. We want a pointer to both
     // ourselves and the thread data so we can thread that through (pun intended).
@@ -292,13 +293,13 @@ fn drainMailbox(
     cb: *CallbackData,
 ) !void {
     // We assert when starting the thread that this is the state
-    const mailbox = cb.io.mailbox.spsc.queue;
+    const mailbox = &cb.io.mailbox;
     const io = cb.io;
     const data = &cb.data;
 
     // If we're draining, we just drain the mailbox and return.
     if (self.flags.drain) {
-        while (mailbox.pop(global.io())) |msg| msg.deinit();
+        while (mailbox.pop()) |msg| msg.deinit();
         return;
     }
 
@@ -306,7 +307,7 @@ fn drainMailbox(
     // expectation is that all our message handlers will be non-blocking
     // ENOUGH to not mess up throughput on producers.
     var redraw: bool = false;
-    while (mailbox.pop(global.io())) |message| {
+    while (mailbox.pop()) |message| {
         // If we have a message we always redraw
         redraw = true;
 

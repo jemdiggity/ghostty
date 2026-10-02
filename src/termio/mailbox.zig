@@ -31,6 +31,17 @@ pub const Mailbox = union(enum) {
     spsc: struct {
         queue: *Queue,
         wakeup: xev.Async,
+        alloc: Allocator,
+
+        /// The thread that drains the queue. It must never wait for room in
+        /// its own queue: nothing else would make room. With external I/O
+        /// it parses output itself, and the stream handler's messages
+        /// (synchronized output, mode changes, responses) are sends to self.
+        owner: std.atomic.Value(std.Thread.Id) = .init(0),
+
+        /// Messages the owner sent while the queue was full, drained first.
+        /// Only the owner thread touches it.
+        overflow: std.ArrayList(termio.Message) = .empty,
     },
 
     /// Init the SPSC writer.
@@ -41,13 +52,15 @@ pub const Mailbox = union(enum) {
         var wakeup = try xev.Async.init();
         errdefer wakeup.deinit();
 
-        return .{ .spsc = .{ .queue = queue, .wakeup = wakeup } };
+        return .{ .spsc = .{ .queue = queue, .wakeup = wakeup, .alloc = alloc } };
     }
 
     pub fn deinit(self: *Mailbox, alloc: Allocator) void {
         switch (self.*) {
             .spsc => |*v| {
                 while (v.queue.pop(global.io())) |msg| msg.deinit();
+                for (v.overflow.items) |msg| msg.deinit();
+                v.overflow.deinit(v.alloc);
                 v.queue.destroy(alloc);
                 v.wakeup.deinit();
             },
@@ -70,6 +83,14 @@ pub const Mailbox = union(enum) {
                 // Try to write to the queue with an instant timeout. This is the
                 // fast path because we can queue without a lock.
                 if (mb.queue.push(global.io(), msg, .{ .instant = {} }) > 0) break :send;
+
+                if (mb.owner.load(.acquire) == std.Thread.getCurrentId()) {
+                    mb.overflow.append(mb.alloc, msg) catch {
+                        log.warn("out of memory queueing a message to self, dropped", .{});
+                        msg.deinit();
+                    };
+                    break :send;
+                }
 
                 // If we enter this conditional, the queue is full. We wake up
                 // the writer thread so that it can process messages to clear up
@@ -105,6 +126,21 @@ pub const Mailbox = union(enum) {
         };
     }
 
+    /// Marks the calling thread as the one that drains this mailbox.
+    pub fn setOwner(self: *Mailbox) void {
+        switch (self.*) {
+            .spsc => |*v| v.owner.store(std.Thread.getCurrentId(), .release),
+        }
+    }
+
+    /// The next message for the owner: what it sent itself while the queue
+    /// was full comes first, since it followed the message being handled.
+    pub fn pop(self: *Mailbox) ?termio.Message {
+        return switch (self.*) {
+            .spsc => |*v| if (v.overflow.items.len > 0) v.overflow.orderedRemove(0) else v.queue.pop(global.io()),
+        };
+    }
+
     /// Notify that there are new messages. This may be a noop depending
     /// on the writer type.
     pub fn notify(self: *Mailbox) void {
@@ -115,6 +151,26 @@ pub const Mailbox = union(enum) {
         }
     }
 };
+
+test "the owner thread never waits for room in its own mailbox" {
+    const testing = std.testing;
+    var mailbox = try Mailbox.initSPSC(testing.allocator);
+    defer mailbox.deinit(testing.allocator);
+    mailbox.setOwner();
+
+    for (0..64) |_| try testing.expect(mailbox.trySend(.{ .inspector = false }));
+    // Full: a non-owner would block here; the owner keeps the message aside.
+    mailbox.send(.{ .inspector = true }, null);
+    for (0..10) |_| mailbox.send(.{ .linefeed_mode = true }, null);
+
+    // Self-sent messages come first, in order, then the queue.
+    const first = mailbox.pop().?;
+    try testing.expect(first == .inspector and first.inspector);
+    for (0..10) |_| try testing.expect(mailbox.pop().? == .linefeed_mode);
+    var queued: usize = 0;
+    while (mailbox.pop()) |msg| : (queued += 1) try testing.expect(msg == .inspector and !msg.inspector);
+    try testing.expectEqual(@as(usize, 64), queued);
+}
 
 test "trySend drops work instead of waiting for a full mailbox" {
     const testing = std.testing;
