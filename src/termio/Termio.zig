@@ -478,29 +478,37 @@ pub fn changeConfig(self: *Termio, td: *ThreadData, config: *DerivedConfig) !voi
     //   - command, working-directory: we never restart the underlying
     //   process so we don't care or need to know about these.
 
-    // Update the default palette. A config change must not fail here, so
-    // if we can't allocate the copy of the configured palette we fall back
-    // to the built-in default, which never allocates.
-    self.terminal.colors.palette.changeDefault(
-        self.alloc,
-        config.palette,
-    ) catch |err| {
-        log.warn("error changing default palette, using built-in default err={}", .{err});
-        self.terminal.colors.palette.resetDefault(self.alloc);
-    };
-    self.terminal.flags.dirty.palette = true;
-
-    // Update all our other colors
-    self.terminal.colors.background.default = config.background.toTerminalRGB();
-    self.terminal.colors.foreground.default = config.foreground.toTerminalRGB();
-    self.terminal.colors.cursor.default = cursor: {
-        const color = config.cursor_color orelse break :cursor null;
-        break :cursor color.toTerminalRGB() orelse break :cursor null;
-    };
+    applyConfigColors(self.alloc, &self.terminal, config);
 
     // Set the image limits
     self.terminal.setKittyGraphicsSizeLimit(self.alloc, config.image_storage_limit);
     self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+}
+
+/// Set the terminal's default colors (palette, background, foreground and
+/// cursor) from the config. Colors a program set with OSC 4/10/11/12 stay
+/// as overrides on top. This cannot fail: if the configured palette can't
+/// be copied we fall back to the built-in default, which never allocates.
+fn applyConfigColors(
+    alloc: Allocator,
+    term: *terminalpkg.Terminal,
+    config: *const DerivedConfig,
+) void {
+    term.colors.palette.changeDefault(
+        alloc,
+        config.palette,
+    ) catch |err| {
+        log.warn("error changing default palette, using built-in default err={}", .{err});
+        term.colors.palette.resetDefault(alloc);
+    };
+    term.flags.dirty.palette = true;
+
+    term.colors.background.default = config.background.toTerminalRGB();
+    term.colors.foreground.default = config.foreground.toTerminalRGB();
+    term.colors.cursor.default = cursor: {
+        const color = config.cursor_color orelse break :cursor null;
+        break :cursor color.toTerminalRGB() orelse break :cursor null;
+    };
 }
 
 /// Resize the terminal.
@@ -563,6 +571,11 @@ pub fn resizeGrid(self: *Termio, cols: u16, rows: u16) !void {
 
 /// Replace terminal state with a decoded native snapshot. The caller must
 /// have ordered this operation through the termio mailbox.
+///
+/// The snapshot's default colors are those of the terminal that encoded it,
+/// usually a headless one with no theme; this surface keeps the defaults
+/// from its own config. Colors a program set with OSC 4/10/11/12 are
+/// overrides and come from the snapshot.
 pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) void {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
@@ -570,6 +583,7 @@ pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) void 
     self.terminal_stream.deinit();
     self.terminal.deinit(self.alloc);
     self.terminal = decoded.toOwned();
+    applyConfigColors(self.alloc, &self.terminal, &self.config);
     self.renderer_state.terminal = &self.terminal;
     self.terminal_stream = .init(.{
         .allocator = self.alloc,
@@ -888,4 +902,56 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "snapshot load keeps configured colors and the program's overrides" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    config.background = .{ .r = 0x14, .g = 0x21, .b = 0x3d };
+    config.foreground = .{ .r = 0xe5, .g = 0xd4, .b = 0xb0 };
+    config.@"cursor-color" = .{ .color = .{ .r = 0x2e, .g = 0xc4, .b = 0xb6 } };
+    config.palette.value[1] = .{ .r = 0xe6, .g = 0x39, .b = 0x46 };
+    config.palette.value[200] = .{ .r = 0x7b, .g = 0x2c, .b = 0xbf };
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    // The encoder is a headless terminal with no theme, where a program set
+    // the foreground and palette entry 4.
+    var source = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+    defer source.deinit(alloc);
+    const fg_override: terminalpkg.color.RGB = .{ .r = 0xff, .g = 0xd1, .b = 0x66 };
+    const p4_override: terminalpkg.color.RGB = .{ .r = 0x11, .g = 0x8a, .b = 0xb2 };
+    source.colors.foreground.set(fg_override);
+    source.colors.palette.set(4, p4_override);
+
+    var encoded: std.Io.Writer.Allocating = .init(alloc);
+    defer encoded.deinit();
+    try terminalpkg.snapshot.encode(alloc, &encoded.writer, &source, .{ .continuation = .ground });
+    var reader: std.Io.Reader = .fixed(encoded.written());
+    var decoded = try terminalpkg.snapshot.decodeExact(alloc, testing.io, &reader, .{ .max_continuation_bytes = 0 });
+    defer decoded.deinit(alloc);
+    var restored = decoded.toOwned();
+    defer restored.deinit(alloc);
+    try testing.expect(restored.colors.background.default == null);
+
+    applyConfigColors(alloc, &restored, &derived);
+
+    const colors = &restored.colors;
+    try testing.expectEqual(config.background.toTerminalRGB(), colors.background.get().?);
+    try testing.expectEqual(config.foreground.toTerminalRGB(), colors.foreground.default.?);
+    try testing.expectEqual(fg_override, colors.foreground.get().?);
+    try testing.expectEqual(terminalpkg.color.RGB{ .r = 0x2e, .g = 0xc4, .b = 0xb6 }, colors.cursor.get().?);
+    try testing.expectEqual(config.palette.value[1], colors.palette.current[1]);
+    try testing.expectEqual(config.palette.value[200], colors.palette.current[200]);
+    try testing.expectEqual(p4_override, colors.palette.current[4]);
+    try testing.expectEqual(config.palette.value[4], colors.palette.original[4]);
+
+    // A later OSC 104/110 reset returns to the configured colors.
+    colors.palette.reset(4);
+    colors.foreground.reset();
+    try testing.expectEqual(config.palette.value[4], colors.palette.current[4]);
+    try testing.expectEqual(config.foreground.toTerminalRGB(), colors.foreground.get().?);
 }

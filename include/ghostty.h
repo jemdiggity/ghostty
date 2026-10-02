@@ -540,6 +540,7 @@ typedef struct {
   uint32_t cell_height_px;
 } ghostty_surface_size_s;
 
+
 // Config types
 
 // config.Path
@@ -571,6 +572,18 @@ typedef struct {
 typedef struct {
   ghostty_config_color_s colors[256];
 } ghostty_config_palette_s;
+
+// Terminal colors of a surface; the has_* flags are false for colors that
+// are unset (the color fields are then zero).
+typedef struct {
+  ghostty_config_color_s foreground;
+  ghostty_config_color_s background;
+  ghostty_config_color_s cursor;
+  bool has_foreground;
+  bool has_background;
+  bool has_cursor;
+  ghostty_config_color_s palette[256];
+} ghostty_surface_colors_s;
 
 // config.QuickTerminalSize
 typedef enum {
@@ -1211,6 +1224,9 @@ GHOSTTY_API bool ghostty_surface_set_grid_size(ghostty_surface_t, uint16_t, uint
 GHOSTTY_API bool ghostty_surface_load_snapshot(ghostty_surface_t, const uint8_t*, size_t);
 GHOSTTY_API void ghostty_surface_set_process_exited(ghostty_surface_t, int32_t);
 GHOSTTY_API ghostty_surface_size_s ghostty_surface_size(ghostty_surface_t);
+GHOSTTY_API bool ghostty_surface_colors(ghostty_surface_t,
+                                        bool,
+                                        ghostty_surface_colors_s*);
 GHOSTTY_API uint64_t ghostty_surface_foreground_pid(ghostty_surface_t);
 GHOSTTY_API ghostty_string_s ghostty_surface_tty_name(ghostty_surface_t);
 GHOSTTY_API void ghostty_surface_set_color_scheme(ghostty_surface_t,

@@ -1521,6 +1521,17 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    // ghostty_surface_colors_s
+    const SurfaceColors = extern struct {
+        foreground: configpkg.Config.Color.C,
+        background: configpkg.Config.Color.C,
+        cursor: configpkg.Config.Color.C,
+        has_foreground: bool,
+        has_background: bool,
+        has_cursor: bool,
+        palette: [256]configpkg.Config.Color.C,
+    };
+
     // ghostty_clipboard_content_s
     //
     // One representation of clipboard contents. The data is binary-safe
@@ -2045,6 +2056,49 @@ pub const CAPI = struct {
             .cell_width_px = surface.core_surface.size.cell.width,
             .cell_height_px = surface.core_surface.size.cell.height,
         };
+    }
+
+    /// Read the terminal's colors: the effective ones (OSC overrides
+    /// applied) or, with `defaults`, the configured defaults beneath them.
+    /// An external I/O owner uses this to answer color queries for the
+    /// surface and to check what a loaded snapshot left in place.
+    export fn ghostty_surface_colors(
+        surface: *Surface,
+        defaults: bool,
+        result: *SurfaceColors,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lockUncancelable(global.io());
+        defer surface.core_surface.renderer_state.mutex.unlock(global.io());
+        const colors = &surface.core_surface.renderer_state.terminal.colors;
+
+        const Dynamic = terminal.color.DynamicRGB;
+        const pick = struct {
+            fn pick(c: *const Dynamic, d: bool) ?terminal.color.RGB {
+                return if (d) c.default else c.get();
+            }
+        }.pick;
+        const toC = struct {
+            fn toC(rgb: terminal.color.RGB) configpkg.Config.Color.C {
+                return .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
+            }
+        }.toC;
+
+        const black: configpkg.Config.Color.C = .{ .r = 0, .g = 0, .b = 0 };
+        const fg = pick(&colors.foreground, defaults);
+        const bg = pick(&colors.background, defaults);
+        const cursor = pick(&colors.cursor, defaults);
+        result.foreground = if (fg) |v| toC(v) else black;
+        result.background = if (bg) |v| toC(v) else black;
+        result.cursor = if (cursor) |v| toC(v) else black;
+        result.has_foreground = fg != null;
+        result.has_background = bg != null;
+        result.has_cursor = cursor != null;
+        const palette: *const terminal.color.Palette = if (defaults)
+            colors.palette.original
+        else
+            &colors.palette.current;
+        for (palette, 0..) |rgb, i| result.palette[i] = toC(rgb);
+        return true;
     }
 
     /// Returns the PID of the foreground process for the surface PTY.
