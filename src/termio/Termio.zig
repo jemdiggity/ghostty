@@ -511,6 +511,17 @@ fn applyConfigColors(
     };
 }
 
+fn applySnapshotConfig(
+    alloc: Allocator,
+    term: *terminalpkg.Terminal,
+    config: *const DerivedConfig,
+) void {
+    applyConfigColors(alloc, term, config);
+    term.setDefaultCursorStyle(config.cursor_style);
+    term.setDefaultCursorBlink(config.cursor_blink);
+    term.setKittyGraphicsSizeLimit(alloc, config.image_storage_limit);
+}
+
 /// Resize the terminal.
 pub fn resize(
     self: *Termio,
@@ -576,14 +587,19 @@ pub fn resizeGrid(self: *Termio, cols: u16, rows: u16) !void {
 /// usually a headless one with no theme; this surface keeps the defaults
 /// from its own config. Colors a program set with OSC 4/10/11/12 are
 /// overrides and come from the snapshot.
-pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) void {
+pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) bool {
     self.renderer_state.mutex.lockUncancelable(global.io());
     defer self.renderer_state.mutex.unlock(global.io());
 
+    const focused = self.terminal.flags.focused;
+    const visible = self.terminal.flags.visible;
     self.terminal_stream.deinit();
     self.terminal.deinit(self.alloc);
     self.terminal = decoded.toOwned();
-    applyConfigColors(self.alloc, &self.terminal, &self.config);
+    applySnapshotConfig(self.alloc, &self.terminal, &self.config);
+    self.terminal.setKittyGraphicsLoadingLimits(.allWithTempDir(global.tmpDirPath()));
+    self.terminal.flags.focused = focused;
+    self.terminal.flags.visible = visible;
     self.renderer_state.terminal = &self.terminal;
     self.terminal_stream = .init(.{
         .allocator = self.alloc,
@@ -607,6 +623,7 @@ pub fn loadSnapshot(self: *Termio, decoded: *terminalpkg.snapshot.Decoded) void 
         .bytes => |bytes| self.terminal_stream.nextSlice(bytes),
     }
     self.renderer_wakeup.notify() catch {};
+    return self.terminal.modes.get(.synchronized_output);
 }
 
 /// Make a size report.
@@ -902,6 +919,44 @@ pub const ThreadData = struct {
 /// not available on a particular platform.
 pub fn getProcessInfo(self: *Termio, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
     return self.backend.getProcessInfo(info);
+}
+
+test "snapshot load takes the configured cursor unless the program chose one" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var config = try configpkg.Config.default(alloc);
+    defer config.deinit();
+    config.@"cursor-style" = .bar;
+    config.@"cursor-style-blink" = false;
+    var derived = try DerivedConfig.init(alloc, &config);
+    defer derived.deinit();
+
+    for ([_]bool{ false, true }) |chosen| {
+        var source = try terminalpkg.Terminal.init(testing.io, alloc, .{ .cols = 8, .rows = 2 });
+        defer source.deinit(alloc);
+        if (chosen) source.setCursorStyle(.steady_underline);
+
+        var encoded: std.Io.Writer.Allocating = .init(alloc);
+        defer encoded.deinit();
+        try terminalpkg.snapshot.encode(alloc, &encoded.writer, &source, .{ .continuation = .ground });
+        var reader: std.Io.Reader = .fixed(encoded.written());
+        var decoded = try terminalpkg.snapshot.decodeExact(alloc, testing.io, &reader, .{ .max_continuation_bytes = 0 });
+        defer decoded.deinit(alloc);
+        var restored = decoded.toOwned();
+        defer restored.deinit(alloc);
+
+        applySnapshotConfig(alloc, &restored, &derived);
+
+        try testing.expectEqual(terminalpkg.Screen.CursorStyle.bar, restored.cursor.default_style);
+        const style = restored.screens.active.cursor.cursor_style;
+        if (chosen) {
+            try testing.expectEqual(terminalpkg.Screen.CursorStyle.underline, style);
+        } else {
+            try testing.expectEqual(terminalpkg.Screen.CursorStyle.bar, style);
+            try testing.expect(!restored.modes.get(.cursor_blinking));
+        }
+    }
 }
 
 test "snapshot load keeps configured colors and the program's overrides" {

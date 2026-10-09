@@ -376,7 +376,7 @@ fn drainMailbox(
                     v.decoded.deinit(v.alloc);
                     v.alloc.destroy(v.decoded);
                 }
-                io.loadSnapshot(v.decoded);
+                if (io.loadSnapshot(v.decoded)) self.startSynchronizedOutput(cb);
             },
             .response_write => |v| switch (v) {
                 .small => |write| try io.queueResponse(
