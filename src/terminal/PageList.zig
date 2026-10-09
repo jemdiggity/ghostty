@@ -1337,6 +1337,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // resize can move the active boundary. Both may expose whole old pages
     // that are now eligible for line-limit pruning.
     self.limits.enforce(self, .lines);
+    self.limits.enforce(self, .bytes);
 }
 
 /// Resize the pagelist with reflow by adding or removing columns.
@@ -11345,6 +11346,36 @@ test "PageList max lines and max size enforce the smaller limit" {
         );
         try testing.expectEqual(s.limits.max(.bytes), s.page_size);
     }
+}
+
+test "PageList resize reflow keeps the byte limit" {
+    const testing = std.testing;
+    const cols: size.CellCountInt = 80;
+    const page_rows: usize = initialCapacity(cols).rows;
+
+    var s = try init(testing.allocator, .{
+        .cols = cols,
+        .rows = 1,
+        .max_size = 3 * PagePool.item_size,
+    });
+    defer s.deinit();
+
+    try s.growRows(3 * page_rows);
+    try testing.expect(s.page_size <= s.limits.max(.bytes));
+    var it = s.pageIterator(.right_down, .{ .screen = .{} }, null);
+    while (it.next()) |chunk| {
+        for (chunk.rows()) |*row| {
+            const cells = chunk.node.page().getCells(row);
+            cells[0] = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'A' } },
+            };
+        }
+    }
+
+    try s.resize(.{ .cols = cols * 4, .reflow = true });
+    try testing.expect(s.page_size <= s.limits.max(.bytes) or
+        s.pages.first.? == s.getTopLeft(.active).node);
 }
 
 test "PageList max lines applies to resize and clone" {
