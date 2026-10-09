@@ -529,6 +529,11 @@ pub fn resize(
     size: renderer.Size,
 ) !void {
     self.size = size;
+    if (self.backend == .external) {
+        _ = self.renderer_mailbox.push(global.io(), .{ .resize = size }, .{ .forever = {} });
+        self.renderer_wakeup.notify() catch {};
+        return;
+    }
     const grid_size = size.grid();
 
     // Update the size of our pty.

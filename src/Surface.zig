@@ -2514,7 +2514,7 @@ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
     self.balancePaddingIfNeeded();
 
     // Notify the terminal
-    self.queueIo(.{ .resize = self.size }, .unlocked);
+    self.queueResize();
 
     // Update our terminal default size if necessary.
     self.recomputeInitialSize() catch |err| {
@@ -2616,6 +2616,22 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     try self.resize(new_screen_size);
 }
 
+fn queueResize(self: *Surface) void {
+    self.queueIo(.{ .resize = self.size }, .unlocked);
+    if (comptime @hasField(@TypeOf(self.rt_surface.*), "io_mode")) {
+        if (self.rt_surface.io_mode == 1) {
+            const grid_size = self.size.grid();
+            if (self.rt_surface.io_resize_request_cb) |callback| callback(
+                self.rt_surface.userdata,
+                grid_size.columns,
+                grid_size.rows,
+                self.size.screen.width,
+                self.size.screen.height,
+            );
+        }
+    }
+}
+
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
     // Save our screen size
     self.size.screen = size;
@@ -2635,23 +2651,7 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
             "set. Is your padding reasonable?", .{});
     }
 
-    // External I/O hosts own the terminal size. Report the proposed grid
-    // without changing terminal state; the host later applies its authority.
-    if (comptime @hasField(@TypeOf(self.rt_surface.*), "io_mode")) {
-        if (self.rt_surface.io_mode == 1) {
-            if (self.rt_surface.io_resize_request_cb) |callback| callback(
-                self.rt_surface.userdata,
-                grid_size.columns,
-                grid_size.rows,
-                self.size.screen.width,
-                self.size.screen.height,
-            );
-        } else {
-            self.queueIo(.{ .resize = self.size }, .unlocked);
-        }
-    } else {
-        self.queueIo(.{ .resize = self.size }, .unlocked);
-    }
+    self.queueResize();
 
     // Mail the render thread so it updates its padding and screen size.
     _ = self.renderer_thread.mailbox.push(
