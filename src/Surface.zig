@@ -1351,10 +1351,32 @@ pub fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void
 }
 
 /// Mark an externally owned process as exited without applying the exec
-/// backend's close policy.
+/// backend's close policy. The exit is shown as for an exec child: the
+/// show_child_exited action, or the notice in the terminal if the runtime
+/// doesn't handle it.
 pub fn externalProcessExited(self: *Surface, status: i32) void {
-    _ = status;
     self.child_exited = true;
+    const info: apprt.surface.Message.ChildExited = .{
+        .exit_code = @bitCast(status),
+        .runtime_ms = 0,
+    };
+    const shown = self.rt_app.performAction(
+        .{ .surface = self },
+        .show_child_exited,
+        info,
+    ) catch |err| shown: {
+        log.err("error trying to show native child exited GUI err={}", .{err});
+        break :shown false;
+    };
+    if (!shown) {
+        self.renderer_state.mutex.lockUncancelable(global.io());
+        defer self.renderer_state.mutex.unlock(global.io());
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.carriageReturn();
+        t.linefeed() catch {};
+        t.printString("Process exited.") catch {};
+        t.modes.set(.cursor_visible, false);
+    }
     self.queueRender() catch |err| log.warn("failed to render external process exit err={}", .{err});
 }
 
