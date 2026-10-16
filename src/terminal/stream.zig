@@ -132,7 +132,6 @@ pub const Action = union(Key) {
     kitty_dnd: KittyDnd,
     resize_window: ResizeWindow,
     osc_unknown: osc.Command.Unknown,
-    program_status: ProgramStatus,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -236,7 +235,6 @@ pub const Action = union(Key) {
             "kitty_dnd",
             "resize_window",
             "osc_unknown",
-            "program_status",
         },
     );
 
@@ -468,8 +466,6 @@ pub const Action = union(Key) {
     pub const KittyClipboard = osc.Command.KittyClipboardProtocol;
 
     pub const KittyDnd = osc.Command.KittyDndProtocol;
-
-    pub const ProgramStatus = osc.Command.ProgramStatus;
 };
 
 /// Returns a type that can process a stream of tty control characters.
@@ -2720,10 +2716,6 @@ pub fn Stream(comptime H: type) type {
 
                 .kitty_dnd_protocol => |v| {
                     self.handler.vt(.kitty_dnd, v);
-                },
-
-                .program_status => |v| {
-                    self.handler.vt(.program_status, v);
                 },
 
                 .unknown => |v| {
