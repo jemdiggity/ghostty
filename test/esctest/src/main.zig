@@ -4,23 +4,27 @@
 //! The build installs esctest in share/esctest beside the bin directory
 //! holding this executable. It runs under a pty. Everything it writes is
 //! fed through a libghostty-vt terminal, and the terminal's replies
-//! (device attributes, cursor position and size reports, and so on) are
-//! written back to it. When esctest exits, its log is copied to stdout.
+//! (DECRQCRA checksums, device attributes, cursor position and size
+//! reports, and so on) are written back to it. When esctest exits, its
+//! log is copied to stdout.
 const std = @import("std");
 const ghostty_vt = @import("ghostty-vt");
 
 const Handler = @FieldType(ghostty_vt.TerminalStream, "handler");
 
-/// The device attributes type isn't exported by libghostty-vt, so it's
-/// taken from the effect that returns it.
-const Attributes = @typeInfo(@typeInfo(@typeInfo(
-    @FieldType(Handler.Effects, "device_attributes"),
-).optional.child).pointer.child).@"fn".return_type.?;
-
 /// The size esctest resets the terminal to before every test, and so the
 /// size it starts at.
 const rows = 25;
 const cols = 80;
+
+/// The xterm checksum calculation esctest expects with --xterm-checksum
+/// 334 and later, which is xterm's `checksumExtension: 23`.
+const xt_checksum: ghostty_vt.xt_checksum.Flags = .{
+    .positive = true,
+    .no_attributes = true,
+    .no_trim = true,
+    .full = true,
+};
 
 /// Arguments always passed to esctest, before the user's own so that
 /// theirs win. esctest only knows how to check a terminal that answers
@@ -178,14 +182,17 @@ fn run(init: std.process.Init) !void {
     var t: ghostty_vt.Terminal = try .init(init.io, init.gpa, .{
         .cols = cols,
         .rows = rows,
+        .default_xt_checksum = xt_checksum,
     });
     defer t.deinit(init.gpa);
 
     var stream = t.vtStream();
     defer stream.deinit();
+    stream.handler.xt_checksum_report = true;
     stream.handler.effects.write_pty = &writePty;
     stream.handler.effects.size = &size;
     stream.handler.effects.device_attributes = &deviceAttributes;
+    stream.handler.effects.resize_window = &resizeWindow;
 
     var buf: [4096]u8 = undefined;
     while (true) {
@@ -229,8 +236,26 @@ fn size(h: *Handler) ?ghostty_vt.size_report.Size {
     };
 }
 
+/// Resize as xterm does when esctest asks with CSI 8 t, keeping a
+/// dimension it gives as zero, and tell esctest's side of the pty.
+fn resizeWindow(h: *Handler, req: Handler.ResizeWindow) void {
+    const grid = switch (req) {
+        .grid => |grid| grid,
+    };
+    const t = h.terminal;
+    const new_rows = if (grid.rows == 0) t.rows else grid.rows;
+    const new_cols = if (grid.columns == 0) t.cols else grid.columns;
+    t.resize(t.gpa(), .{ .cols = new_cols, .rows = new_rows }) catch |err| {
+        std.log.err("resizing to {d}x{d} failed: {t}", .{ new_cols, new_rows, err });
+        return;
+    };
+
+    const ws: std.c.winsize = .{ .row = new_rows, .col = new_cols, .xpixel = 0, .ypixel = 0 };
+    _ = std.c.ioctl(pty, std.c.T.IOCSWINSZ, &ws);
+}
+
 /// Answer as a VT520, the terminal esctest's highest VT level tests.
-fn deviceAttributes(_: *Handler) Attributes {
+fn deviceAttributes(_: *Handler) ghostty_vt.device_attributes.Attributes {
     return .{
         .primary = .{
             .conformance_level = .level_5,
