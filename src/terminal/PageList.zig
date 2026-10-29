@@ -29,7 +29,7 @@ const Page = pagepkg.Page;
 const Row = pagepkg.Row;
 
 const log = std.log.scoped(.page_list);
-const native_freestanding = builtin.os.tag == .freestanding and
+const native_freestanding = builtin.target.os.tag == .freestanding and
     !builtin.target.cpu.arch.isWasm();
 
 /// The number of pages we preheat the page pool with. For operating systems
@@ -354,7 +354,7 @@ else untouched: {
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
 const PinSet = std.AutoArrayHashMapUnmanaged(*Pin, void);
-const PinPool = std.heap.memory_pool.Managed(Pin);
+const PinPool = std.heap.MemoryPool(Pin);
 
 /// The pool of memory used for a pagelist. This can be shared between
 /// multiple pagelists but it is not threadsafe.
@@ -388,7 +388,7 @@ pub const MemoryPool = struct {
     pub fn deinit(self: *MemoryPool) void {
         self.pages.deinit();
         self.nodes.deinit();
-        self.pins.deinit();
+        self.pins.deinit(self.alloc);
     }
 
     pub fn reset(self: *MemoryPool, mode: ResetMode) void {
@@ -667,7 +667,7 @@ pub fn init(
 
     // We always track our viewport pin to ensure this is never an allocation
     try tw.check(.viewport_pin);
-    const viewport_pin = try pool.pins.create();
+    const viewport_pin = try pool.pins.create(pool.alloc);
     viewport_pin.* = .{ .node = page_list.first.? };
 
     try tw.check(.viewport_pin_track);
@@ -764,7 +764,7 @@ fn initPages(
         // (WASM), the WasmAllocator reuses freed slots without zeroing since
         // only fresh memory.grow pages are guaranteed zero by the WASM spec.
         // On native, the OS page allocator (mmap) returns zeroed pages.
-        if (comptime std.debug.runtime_safety or builtin.os.tag == .freestanding)
+        if (comptime std.debug.runtime_safety or builtin.target.os.tag == .freestanding)
             @memset(page_buf, 0);
 
         // Initialize the first set of pages to contain our viewport so that
@@ -1112,7 +1112,7 @@ pub fn clone(
 
     // Create our viewport. In a clone, the viewport always goes
     // to the top.
-    const viewport_pin = try pool.pins.create();
+    const viewport_pin = try pool.pins.create(pool.alloc);
     var tracked_pins = try initTrackedPins(pool.alloc, viewport_pin);
     errdefer tracked_pins.deinit(pool.alloc);
 
@@ -1163,7 +1163,7 @@ pub fn clone(
                 if (p.node != chunk.node or
                     p.y < chunk.start or
                     p.y >= chunk.end) continue;
-                const new_p = try pool.pins.create();
+                const new_p = try pool.pins.create(pool.alloc);
                 new_p.* = p.*;
                 new_p.node = node;
                 new_p.y -= chunk.start;
@@ -4646,7 +4646,7 @@ inline fn createPageExt(
     // come from the OS page allocator (zeroed pages), destroyNodeExt
     // zeroes buffers before returning them to the pool, and the pool
     // never writes into its items (see PagePool).
-    if (comptime std.debug.runtime_safety or builtin.os.tag == .freestanding)
+    if (comptime std.debug.runtime_safety or builtin.target.os.tag == .freestanding)
         @memset(page_buf, 0);
 
     page.* = .{
@@ -5558,6 +5558,10 @@ fn eraseRows(
     // The count of rows that was erased.
     var erased: usize = 0;
 
+    // Erased history rows are gone for good, so mark the pins that pointed
+    // to them as garbage.
+    const discard = tl_pt == .history;
+
     // A pageIterator iterates one page at a time from the back forward.
     // "back" here is in terms of scrollback, but actually the front of the
     // linked list.
@@ -5581,6 +5585,9 @@ fn eraseRows(
             }
 
             erased += chunk.node.rows();
+            if (discard) for (self.tracked_pins.keys()) |p| {
+                if (p.node == chunk.node) p.garbage = true;
+            };
             self.erasePage(chunk.node);
             continue;
         }
@@ -5627,6 +5634,7 @@ fn eraseRows(
             } else {
                 p.y = 0;
                 p.x = 0;
+                if (discard) p.garbage = true;
             }
         }
 
@@ -5717,7 +5725,7 @@ pub fn trackPin(self: *PageList, p: Pin) Allocator.Error!*Pin {
     if (build_options.slow_runtime_safety) assert(self.pinIsValid(p));
 
     // Create our tracked pin
-    const tracked = try self.pool.pins.create();
+    const tracked = try self.pool.pins.create(self.pool.alloc);
     errdefer self.pool.pins.destroy(tracked);
     tracked.* = p;
 
@@ -7714,7 +7722,7 @@ pub const Builder = struct {
         };
 
         // Set our viewport up to the active
-        const viewport_pin = try self.pool.pins.create();
+        const viewport_pin = try self.pool.pins.create(self.pool.alloc);
         errdefer self.pool.pins.destroy(viewport_pin);
         viewport_pin.* = active_top;
 
@@ -14315,6 +14323,34 @@ test "PageList erase row with tracked pin resets to top-left" {
     try testing.expectEqual(s.pages.first.?, p.node);
     try testing.expectEqual(@as(usize, 0), p.y);
     try testing.expectEqual(@as(usize, 0), p.x);
+
+    // Its row was erased, so it should be garbage
+    try testing.expect(p.garbage);
+}
+
+test "PageList eraseHistory marks pins in erased rows as garbage" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 80, .rows = 24 });
+    defer s.deinit();
+
+    // A few rows of history on the same page as the active area.
+    for (0..10) |_| _ = try s.grow();
+    try testing.expectEqual(@as(usize, 34), s.total_rows);
+
+    const history = try s.trackPin(s.pin(.{ .history = .{ .y = 5 } }).?);
+    defer s.untrackPin(history);
+    const active = try s.trackPin(s.pin(.{ .active = .{ .y = 2 } }).?);
+    defer s.untrackPin(active);
+
+    s.eraseHistory(null);
+    try testing.expectEqual(s.rows, s.total_rows);
+
+    // The history row is gone, the active row just moved up.
+    try testing.expect(history.garbage);
+    try testing.expect(!active.garbage);
+    try testing.expectEqual(point.Point{ .screen = .{ .y = 2 } }, s.pointFromPin(.screen, active.*).?);
 }
 
 test "PageList erase row with tracked pin shifts" {
@@ -14710,7 +14746,7 @@ test "PageList eraseRow hyperlink-dense row crosses page boundary" {
         const page = s.pages.last.?.page();
         for (0..link_count) |x| {
             var buf: [64]u8 = undefined;
-            const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+            const uri = try std.mem.print(&buf, "http://example.com/{d}", .{x});
             const id = try page.insertHyperlink(.{
                 .id = .{ .implicit = @intCast(x) },
                 .uri = uri,
@@ -14758,7 +14794,7 @@ test "PageList eraseRow hyperlink-dense row crosses page boundary" {
         const id = page.lookupHyperlink(list_cell.cell).?;
         const link = page.hyperlink_set.get(page.memory, id);
         var buf: [64]u8 = undefined;
-        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+        const uri = try std.mem.print(&buf, "http://example.com/{d}", .{x});
         try testing.expectEqualStrings(uri, link.uri.slice(page.memory));
     }
 
@@ -14822,7 +14858,7 @@ test "PageList eraseRowBounded hyperlink-dense row crosses page boundary" {
         const page = s.pages.last.?.page();
         for (0..link_count) |x| {
             var buf: [64]u8 = undefined;
-            const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+            const uri = try std.mem.print(&buf, "http://example.com/{d}", .{x});
             const id = try page.insertHyperlink(.{
                 .id = .{ .implicit = @intCast(x) },
                 .uri = uri,
@@ -14867,7 +14903,7 @@ test "PageList eraseRowBounded hyperlink-dense row crosses page boundary" {
         const id = page.lookupHyperlink(list_cell.cell).?;
         const link = page.hyperlink_set.get(page.memory, id);
         var buf: [64]u8 = undefined;
-        const uri = try std.fmt.bufPrint(&buf, "http://example.com/{d}", .{x});
+        const uri = try std.mem.print(&buf, "http://example.com/{d}", .{x});
         try testing.expectEqualStrings(uri, link.uri.slice(page.memory));
     }
 
@@ -16158,6 +16194,25 @@ test "PageList resize (no reflow) more rows adds blank rows if cursor at bottom"
     }
 }
 
+test "PageList resize reflow from max cols to narrow" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A max-width page is large enough that narrowing it to 2 columns
+    // frees memory for more rows than a page can hold. The resize must
+    // cap the row count instead of overflowing it.
+    var s = try init(alloc, .{
+        .cols = std.math.maxInt(size.CellCountInt),
+        .rows = 1,
+        .max_size = 0,
+    });
+    defer s.deinit();
+
+    try s.resize(.{ .cols = 2, .reflow = true });
+    try testing.expectEqual(@as(usize, 2), s.cols);
+    s.assertIntegrity();
+}
+
 test "PageList resize reflow more cols no wrapped rows" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -16991,9 +17046,10 @@ test "PageList resize reflow exceeds hyperlink memory forcing capacity increase"
     // Mark the final row as wrapped.
     {
         const page = s.pages.first.?.page();
+        const uri: [pagepkg.string_bytes_default - 1]u8 = @splat('a');
         const id = try page.insertHyperlink(.{
             .id = .{ .implicit = 0 },
-            .uri = "a" ** (pagepkg.string_bytes_default - 1),
+            .uri = &uri,
         });
         const rac = page.getRowAndCell(page.size.cols - 1, page.size.rows - 1);
         rac.row.wrap = true;
@@ -17015,9 +17071,10 @@ test "PageList resize reflow exceeds hyperlink memory forcing capacity increase"
     // Mark the first row as a wrap continuation.
     {
         const page = s.pages.last.?.page();
+        const uri: [pagepkg.string_bytes_default - 1]u8 = @splat('a');
         const id = try page.insertHyperlink(.{
             .id = .{ .implicit = 1 },
-            .uri = "a" ** (pagepkg.string_bytes_default - 1),
+            .uri = &uri,
         });
         const rac = page.getRowAndCell(0, 0);
         rac.row.wrap_continuation = true;
@@ -17089,9 +17146,9 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
     //  …B | <- B is hyperlinked with a 33-byte URI and 31-byte ID.
     //  +--+
 
-    const uri_a = "a" ** (pagepkg.string_bytes_default - 64);
-    const uri_b = "b" ** 33;
-    const id_b = "i" ** 31;
+    const uri_a: [pagepkg.string_bytes_default - 64]u8 = @splat('a');
+    const uri_b: [33]u8 = @splat('b');
+    const id_b: [31]u8 = @splat('i');
 
     // Hyperlink A in the bottom right of the first page. Mark the final
     // row as wrapped.
@@ -17099,7 +17156,7 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
         const page = s.pages.first.?.page();
         const id = try page.insertHyperlink(.{
             .id = .{ .implicit = 0 },
-            .uri = uri_a,
+            .uri = &uri_a,
         });
         const rac = page.getRowAndCell(page.size.cols - 1, page.size.rows - 1);
         rac.row.wrap = true;
@@ -17117,8 +17174,8 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
         try std.testing.expectError(
             error.StringsOutOfMemory,
             page.insertHyperlink(.{
-                .id = .{ .explicit = id_b },
-                .uri = uri_b,
+                .id = .{ .explicit = &id_b },
+                .uri = &uri_b,
             }),
         );
     }
@@ -17128,8 +17185,8 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
     {
         const page = s.pages.last.?.page();
         const id = try page.insertHyperlink(.{
-            .id = .{ .explicit = id_b },
-            .uri = uri_b,
+            .id = .{ .explicit = &id_b },
+            .uri = &uri_b,
         });
         const rac = page.getRowAndCell(0, 0);
         rac.row.wrap_continuation = true;
@@ -17158,11 +17215,11 @@ test "PageList resize reflow hyperlink dupe string alloc chunk rounding" {
                 const entry = page.hyperlink_set.get(page.memory, link_id);
                 const uri = entry.uri.slice(page.memory);
                 switch (entry.id) {
-                    .implicit => try testing.expectEqualStrings(uri_a, uri),
+                    .implicit => try testing.expectEqualStrings(&uri_a, uri),
                     .explicit => |slice| {
-                        try testing.expectEqualStrings(uri_b, uri);
+                        try testing.expectEqualStrings(&uri_b, uri);
                         try testing.expectEqualStrings(
-                            id_b,
+                            &id_b,
                             slice.slice(page.memory),
                         );
                     },
