@@ -376,6 +376,7 @@ fn drainMailbox(
                     v.alloc.destroy(v.decoded);
                 }
                 if (io.loadSnapshot(v.decoded)) self.startSynchronizedOutput(cb);
+                if (io.terminal.modes.get(.focus_event)) try io.focusGained(data, io.terminal.flags.focused);
             },
             .response_write => |v| switch (v) {
                 .small => |write| try io.queueResponse(
